@@ -16,6 +16,7 @@ import argparse
 import json
 import sys
 import os
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -58,16 +59,47 @@ class TDDAgent:
             content = f.read()
         
         # Handle markdown-wrapped specs
+        raw_content = content
         if '```markdown' in content:
-            content = content.split('```markdown')[1].split('```')[0]
+            raw_content = content.split('```markdown')[1].split('```')[0]
         elif '```' in content:
-            content = content.split('```')[1].split('```')[0]
+            raw_content = content.split('```')[1].split('```')[0]
+        
+        # Extract module name from spec
+        module_name = self._extract_module_name(raw_content)
         
         return {
-            'raw': content,
-            'module_name': self.ticket_id.split('-')[-1] if '-' in self.ticket_id else 'generated',
+            'raw': raw_content,
+            'module_name': module_name,
             'language': self.spec_path.stem.split('-')[0] if '-' in self.spec_path.stem else None
         }
+    
+    def _extract_module_name(self, content: str) -> str:
+        """Extract a reasonable module name from spec content."""
+        # Try to find "Project Name" or similar
+        patterns = [
+            r'Project Name[":\s]+[`"]?(\w+)[`"]?',
+            r'Project Name:\s+`(\w+)`',
+            r'### .*?\((\w+)\)',
+            r'module_name:\s*(\w+)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, content, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        
+        # Fallback: use ticket ID but clean it up
+        # e.g., "20260318-esp32-can-bus-foundation-for-r" -> "can_bus_foundation"
+        parts = self.ticket_id.split('-')
+        if len(parts) > 3:
+            # Skip date and use descriptive parts
+            descriptive = [p for p in parts[1:] if p not in ['for', 'the', 'a', 'an', 'and']]
+            if descriptive:
+                return '_'.join(descriptive[-3:])  # Last 3 meaningful parts
+        
+        # Last resort: use last part of ticket
+        return parts[-1] if parts else 'generated'
     
     def run(self) -> bool:
         """
@@ -77,6 +109,7 @@ class TDDAgent:
         print(f"[TDD_AGENT] Language: {self.language}")
         print(f"[TDD_AGENT] Handler: {self.handler.language_name}")
         print(f"[TDD_AGENT] Test Framework: {self.handler.test_framework}")
+        print(f"[TDD_AGENT] Module: {self.spec['module_name']}")
         
         # Setup environment
         print(f"[TDD_AGENT] Setting up environment...")
@@ -106,6 +139,9 @@ class TDDAgent:
                 
                 print(f"[TDD_AGENT] Test result: {'PASSED' if test_result.passed else 'FAILED'}")
                 print(f"[TDD_AGENT] Duration: {test_result.duration_ms}ms")
+                
+                if test_result.output:
+                    print(f"[TDD_AGENT] Output: {test_result.output[:200]}")
                 
                 if test_result.passed:
                     # Judge evaluation
@@ -176,6 +212,8 @@ def main():
     except Exception as e:
         print(f"\n{'='*60}")
         print(f"ERROR: {e}")
+        import traceback
+        traceback.print_exc()
         print(f"{'='*60}")
         sys.exit(2)
 

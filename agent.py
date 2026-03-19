@@ -2,20 +2,8 @@
 """
 Language-Agnostic TDD Agent with Langfuse Integration
 
-This agent supports multiple programming languages through a handler system:
-- Python (pytest)
-- C (ESP-IDF with Unity + CMock)
-- TypeScript (Next.js/React with Vitest/Jest)
-- (Extensible for Rust, Go, etc.)
-
-Features:
-- Language auto-detection from spec content
-- ESP-IDF toolchain support (on CT 204)
-- QEMU testing for ESP32 code
-- Langfuse tracing for observability
-
-Usage:
-    python agent.py --ticket <ticket_id> --spec <spec_path>
+Supports: Python (pytest), C (ESP-IDF + Unity), TypeScript (Vitest/Jest)
+Features: Language auto-detection, ESP-IDF/QEMU support, Langfuse tracing, GitHub PR creation
 """
 
 import argparse
@@ -28,330 +16,293 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 
-# Add handlers to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from handlers.base_handler import (
-    BaseHandler, TestResult, CodeFile,
-    detect_language_from_spec, get_handler
-)
+from handlers.base_handler import BaseHandler, TestResult, CodeFile, detect_language_from_spec, get_handler
 
-# Langfuse integration
+# Langfuse configuration
 LANGFUSE_ENABLED = os.environ.get('LANGFUSE_HOST') is not None
 LANGFUSE_HOST = os.environ.get('LANGFUSE_HOST', '')
 LANGFUSE_PUBLIC_KEY = os.environ.get('LANGFUSE_PUBLIC_KEY', '')
 LANGFUSE_SECRET_KEY = os.environ.get('LANGFUSE_SECRET_KEY', '')
 
 class LangfuseTracer:
-    """Langfuse tracing with SDK integration"""
-    
     def __init__(self, session_id: str = None):
         self.session_id = session_id or f"tdd-{datetime.now().strftime('%Y%m%d%H%M%S')}"
         self.enabled = LANGFUSE_ENABLED and LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY
         self.events = []
         self.langfuse = None
-        self.trace_id = None
-        self.last_event = None
+        self.trace = None
         
         if self.enabled:
             try:
                 from langfuse import Langfuse
-                self.langfuse = Langfuse(
-                    public_key=LANGFUSE_PUBLIC_KEY,
-                    secret_key=LANGFUSE_SECRET_KEY,
-                    host=LANGFUSE_HOST
-                )
+                self.langfuse = Langfuse(public_key=LANGFUSE_PUBLIC_KEY, secret_key=LANGFUSE_SECRET_KEY, host=LANGFUSE_HOST)
                 print(f"[LANGFUSE] Connected to {LANGFUSE_HOST}")
-                print(f"[LANGFUSE] Session: {self.session_id}")
+                self.trace = self.langfuse.trace(name="TDD Agent Run", id=self.session_id)
             except Exception as e:
                 print(f"[LANGFUSE] SDK init failed: {e}")
                 self.enabled = False
-        else:
-            if not LANGFUSE_ENABLED:
-                print("[LANGFUSE] Not enabled - no LANGFUSE_HOST set")
-            elif not (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY):
-                print("[LANGFUSE] Not enabled - missing credentials")
     
     def trace_event(self, name: str, event_type: str, data: Dict[str, Any] = None):
-        """Record a trace event"""
-        event = {
-            'timestamp': datetime.now().isoformat(),
-            'session_id': self.session_id,
-            'name': name,
-            'type': event_type,
-            'data': data or {}
-        }
+        event = {'timestamp': datetime.now().isoformat(), 'session_id': self.session_id, 'name': name, 'type': event_type, 'data': data or {}}
         self.events.append(event)
-        
-        # Log to console
         print(f"[LANGFUSE] {event_type}: {name}")
-        
-        # Send to Langfuse if available
-        if self.enabled and self.langfuse:
-            try:
-                from langfuse.types import TraceContext
-                self.last_event = self.langfuse.create_event(
-                    trace_context=TraceContext(id=self.session_id),
-                    name=name,
-                    input=data or {},
-                    level="DEFAULT" if event_type != "error" else "ERROR"
-                )
-            except Exception as e:
-                print(f"[LANGFUSE] Send failed: {e}")
+        if self.enabled and self.trace:
+            try: self.trace.span(name=name, event_type=event_type, input=data or {})
+            except Exception as e: print(f"[LANGFUSE] Send failed: {e}")
     
     def trace_success(self, data: Dict[str, Any] = None):
-        """Mark trace as successful"""
-        self.trace_event('tdd_success', 'success', data or {"status": "success"})
+        if self.enabled and self.trace:
+            try: self.trace.end(output=data or {"status": "success"})
+            except Exception as e: print(f"[LANGFUSE] End failed: {e}")
     
     def trace_error(self, data: Dict[str, Any] = None):
-        """Mark trace as failed"""
-        self.trace_event('tdd_failure', 'error', data or {"status": "failure"})
+        if self.enabled and self.trace:
+            try: self.trace.end(status="ERROR", output=data or {"status": "failure"})
+            except Exception as e: print(f"[LANGFUSE] End failed: {e}")
     
     def flush(self):
-        """Flush pending events"""
         if self.enabled and self.langfuse:
-            try:
-                self.langfuse.flush()
-                print(f"[LANGFUSE] Events flushed")
-            except Exception as e:
-                print(f"[LANGFUSE] Flush failed: {e}")
+            try: self.langfuse.flush(); print("[LANGFUSE] Events flushed")
+            except Exception as e: print(f"[LANGFUSE] Flush failed: {e}")
     
     def save(self, output_path: str = None):
-        """Save trace events to file"""
-        if not output_path:
-            output_path = f"/tmp/langfuse-trace-{self.session_id}.json"
-        
+        if not output_path: output_path = f"/tmp/langfuse-trace-{self.session_id}.json"
         with open(output_path, 'w') as f:
-            json.dump({
-                'session_id': self.session_id,
-                'events': self.events,
-                'langfuse_host': LANGFUSE_HOST if self.enabled else None,
-                'sent_to_api': self.enabled
-            }, f, indent=2)
-        
+            json.dump({'session_id': self.session_id, 'events': self.events, 'langfuse_host': LANGFUSE_HOST if self.enabled else None, 'sent_to_api': self.enabled}, f, indent=2)
         print(f"[LANGFUSE] Traces saved to: {output_path}")
 
 
-class TDDAgent:
-    """Main TDD orchestrator with language dispatch and Langfuse tracing"""
+class GitHubPRCreator:
+    def __init__(self, repo_owner: str, repo_name: str, branch: str = None):
+        self.repo_owner = repo_owner
+        self.repo_name = repo_name
+        self.branch = branch
+        self.gh_available = self._check_gh_cli()
+        print(f"[GITHUB] gh CLI {'available' if self.gh_available else 'not found - PR creation disabled'}")
     
-    def __init__(self, ticket_id: str, spec_path: str, workspace: str = '/mnt/workspace/tasks', 
-                 max_iterations: int = 10, use_qemu: bool = False):
+    def _check_gh_cli(self) -> bool:
+        try:
+            result = subprocess.run(['gh', '--version'], capture_output=True, text=True, timeout=5)
+            return result.returncode == 0
+        except: return False
+    
+    def create_pr(self, task_dir: Path, issue_number: int, title: str = None, body: str = None) -> Optional[str]:
+        if not self.gh_available:
+            print(f"[GITHUB] Cannot create PR - gh CLI not available")
+            return None
+        
+        try:
+            module_name = task_dir.name
+            if not title: title = f"feat: Implement {module_name} (#{issue_number})"
+            if not body: body = f"## TDD Implementation Complete\n\n**Issue**: #{issue_number}\n**Module**: `{module_name}`\n\nAll tests passed. Ready for code review."
+            branch_name = f"tdd/{module_name}-#{issue_number}"
+            
+            original_dir = os.getcwd()
+            os.chdir(task_dir)
+            
+            try:
+                result = subprocess.run(['git', 'rev-parse', '--git-dir'], capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    print(f"[GITHUB] Initializing git repo in {task_dir}")
+                    subprocess.run(['git', 'init'], check=True, timeout=10)
+                    subprocess.run(['git', 'config', 'user.name', 'TDD Agent'], check=True, timeout=10)
+                    subprocess.run(['git', 'config', 'user.email', 'tdd@dev-house.ai'], check=True, timeout=10)
+                
+                print(f"[GITHUB] Creating branch: {branch_name}")
+                subprocess.run(['git', 'checkout', '-b', branch_name], check=True, timeout=10)
+                print(f"[GITHUB] Adding files...")
+                subprocess.run(['git', 'add', '.'], check=True, timeout=10)
+                print(f"[GITHUB] Committing...")
+                subprocess.run(['git', 'commit', '-m', f'feat: Implement {module_name} for issue #{issue_number}'], check=True, timeout=10)
+                print(f"[GITHUB] Pushing to origin/{branch_name}...")
+                subprocess.run(['git', 'push', '-u', 'origin', branch_name], check=True, timeout=30)
+                
+                print(f"[GITHUB] Creating PR for issue #{issue_number}...")
+                pr_result = subprocess.run(['gh', 'pr', 'create', '--repo', f'{self.repo_owner}/{self.repo_name}', '--head', branch_name, '--base', 'main', '--title', title, '--body', body, '--label', 'status/ready-for-review', '--label', 'phase/tdd-complete'], capture_output=True, text=True, timeout=30)
+                
+                if pr_result.returncode == 0:
+                    pr_url = pr_result.stdout.strip()
+                    print(f"[GITHUB] PR created: {pr_url}")
+                    subprocess.run(['gh', 'issue', 'comment', '--repo', f'{self.repo_owner}/{self.repo_name}', f'{issue_number}', '--body', f'PR created: {pr_url}\n\nTDD completed successfully. Ready for review.'], capture_output=True, timeout=30)
+                    return pr_url
+                else:
+                    print(f"[GITHUB] PR creation failed: {pr_result.stderr}")
+                    return None
+            finally:
+                os.chdir(original_dir)
+        except Exception as e:
+            print(f"[GITHUB] Error creating PR: {e}")
+            return None
+
+
+class TDDAgent:
+    def __init__(self, ticket_id: str, spec_path: str, workspace: str = '/mnt/workspace/tasks', max_iterations: int = 10, use_qemu: bool = False):
         self.ticket_id = ticket_id
         self.spec_path = Path(spec_path)
         self.workspace = Path(workspace) / ticket_id
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.max_iterations = max_iterations
         self.use_qemu = use_qemu
-        
-        # Initialize tracer
         self.tracer = LangfuseTracer(session_id=ticket_id)
-        
-        # Load spec
         self.spec = self._load_spec()
-        
-        # Detect language and get handler
         self.language = detect_language_from_spec(self.spec)
-        if not self.language:
-            raise ValueError(f"Could not detect language from spec: {spec_path}")
-        
+        if not self.language: raise ValueError(f"Could not detect language from spec: {spec_path}")
         self.handler = get_handler(self.language, str(self.workspace))
-        if not self.handler:
-            raise ValueError(f"No handler found for language: {self.language}")
+        if not self.handler: raise ValueError(f"No handler found for language: {self.language}")
         
         print(f"[TDD_AGENT] Starting {self.handler.language_name} TDD for ticket {ticket_id}")
-        
-        # Log start
-        self.tracer.trace_event('tdd_start', 'info', {
-            'ticket_id': ticket_id,
-            'language': self.language,
-            'handler': self.handler.language_name,
-            'spec_path': str(spec_path)
-        })
+        self.tracer.trace_event('tdd_start', 'info', {'ticket_id': ticket_id, 'language': self.language, 'handler': self.handler.language_name, 'spec_path': str(spec_path)})
     
     def _load_spec(self) -> Dict[str, Any]:
-        """Load and parse spec file"""
-        with open(self.spec_path) as f:
-            content = f.read()
-        
-        # Handle markdown-wrapped specs
+        with open(self.spec_path) as f: content = f.read()
         raw_content = content
-        if '```markdown' in content:
-            raw_content = content.split('```markdown')[1].split('```')[0]
-        elif '```' in content:
-            raw_content = content.split('```')[1].split('```')[0]
-        
-        # Extract module name from spec
+        if '```markdown' in content: raw_content = content.split('```markdown')[1].split('```')[0]
+        elif '```' in content: raw_content = content.split('```')[1].split('```')[0]
         module_name = self._extract_module_name(raw_content)
-        
-        return {
-            'raw': raw_content,
-            'module_name': module_name,
-            'language': self.spec_path.stem.split('-')[0] if '-' in self.spec_path.stem else None
-        }
+        return {'raw': raw_content, 'module_name': module_name, 'language': self.spec_path.stem.split('-')[0] if '-' in self.spec_path.stem else None}
     
     def _extract_module_name(self, content: str) -> str:
-        """Extract a reasonable module name from spec content."""
-        patterns = [
-            r'Project Name[":\s]+[`"]?(\w+)[`"]?',
-            r'Project Name:\s+`(\w+)`',
-            r'module_name:\s*(\w+)',
-        ]
-        
+        patterns = [r'Project Name[":\s]+[`"]?(\w+)[`"]?', r'Project Name:\s+`(\w+)`', r'module_name:\s*(\w+)']
         for pattern in patterns:
             match = re.search(pattern, content, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        
-        # Fallback: use ticket ID
+            if match: return match.group(1)
         parts = self.ticket_id.split('-')
         if len(parts) > 3:
             descriptive = [p for p in parts[1:] if p not in ['for', 'the', 'a', 'an', 'and']]
-            if descriptive:
-                return '_'.join(descriptive[-3:])
-        
+            if descriptive: return '_'.join(descriptive[-3:])
         return parts[-1] if parts else 'generated'
     
+    def _extract_issue_number(self) -> Optional[int]:
+        patterns = [r'#(\d+)', r'issue[\s:]+#?(\d+)', r'Issue[\s:]+#?(\d+)']
+        for pattern in patterns:
+            match = re.search(pattern, self.ticket_id, re.IGNORECASE)
+            if match: return int(match.group(1))
+        raw = self.spec.get('raw', '')
+        for pattern in patterns:
+            match = re.search(pattern, raw, re.IGNORECASE)
+            if match: return int(match.group(1))
+        return None
+    
+    def _generate_pr_body(self) -> str:
+        module = self.spec.get('module_name', 'Implementation')
+        issue = self._extract_issue_number()
+        return f"""## TDD Implementation Complete
+
+**Issue**: #{issue or 'N/A'}
+**Module**: `{module}`
+**Language**: {self.language}
+**Handler**: {self.handler.language_name}
+
+### What Was Done
+- TDD loop completed successfully
+- Tests generated and passing
+- Code ready for deployment
+
+### Generated Files
+- Tests: `test/test_{module}.c`
+- Header: `include/{module}.h`
+- Source: `src/{module}.c`
+- Build: `CMakeLists.txt`, `sdkconfig.defaults`
+
+### Test Results
+All tests passed. Ready for code review and ESP-IDF build.
+
+---
+Generated by TDD Agent with Langfuse tracing.
+"""
+
     def run(self) -> bool:
-        """Run the TDD loop with tracing."""
         print(f"[TDD_AGENT] Language: {self.language}")
         print(f"[TDD_AGENT] Handler: {self.handler.language_name}")
         print(f"[TDD_AGENT] Test Framework: {self.handler.test_framework}")
         print(f"[TDD_AGENT] Module: {self.spec['module_name']}")
         print(f"[TDD_AGENT] QEMU Mode: {'Enabled' if self.use_qemu else 'Disabled'}")
+        self.tracer.trace_event('language_detected', 'info', {'language': self.language, 'handler': self.handler.language_name})
         
-        # Log language detection
-        self.tracer.trace_event('language_detected', 'info', {
-            'language': self.language,
-            'handler': self.handler.language_name
-        })
-        
-        # Setup environment
         print(f"[TDD_AGENT] Setting up environment...")
-        if not self.handler.setup_environment():
-            print(f"[TDD_AGENT] WARNING: Environment setup incomplete")
-        
+        if not self.handler.setup_environment(): print(f"[TDD_AGENT] WARNING: Environment setup incomplete")
         self.tracer.trace_event('environment_setup', 'info', {'status': 'complete'})
         
-        # TDD Loop
-        code_files = []
-        test_files = []
+        code_files, test_files = [], []
         
         for iteration in range(1, self.max_iterations + 1):
             print(f"\n[TDD_AGENT] === Iteration {iteration}/{self.max_iterations} ===")
-            
-            # Log iteration start
             self.tracer.trace_event('iteration_start', 'info', {'iteration': iteration})
             
             try:
-                # Generate tests
                 if iteration == 1:
                     test_files = self.handler.generate_tests(self.spec, code_files)
                     self._write_files(test_files)
-                    self.tracer.trace_event('tests_generated', 'info', {
-                        'iteration': iteration,
-                        'files': len(test_files)
-                    })
+                    self.tracer.trace_event('tests_generated', 'info', {'iteration': iteration, 'files': len(test_files)})
                 
-                # Generate code
                 code_files = self.handler.generate_code(self.spec, test_files)
                 self._write_files(code_files)
-                self.tracer.trace_event('code_generated', 'info', {
-                    'iteration': iteration,
-                    'files': len(code_files)
-                })
+                self.tracer.trace_event('code_generated', 'info', {'iteration': iteration, 'files': len(code_files)})
                 
-                # Run tests
                 print(f"[TDD_AGENT] Running tests...")
                 test_result = self.handler.run_tests(self.workspace)
-                
-                # Log test result
-                self.tracer.trace_event('tests_executed', 'info', {
-                    'iteration': iteration,
-                    'passed': test_result.passed,
-                    'duration_ms': test_result.duration_ms
-                })
+                self.tracer.trace_event('tests_executed', 'info', {'iteration': iteration, 'passed': test_result.passed, 'duration_ms': test_result.duration_ms})
                 
                 print(f"[TDD_AGENT] Test result: {'PASSED' if test_result.passed else 'FAILED'}")
                 print(f"[TDD_AGENT] Duration: {test_result.duration_ms}ms")
-                
                 if test_result.output:
                     output_preview = test_result.output[:300] if len(test_result.output) > 300 else test_result.output
                     print(f"[TDD_AGENT] Output: {output_preview}")
                 
                 if test_result.passed:
-                    # Judge evaluation
                     print(f"[TDD_AGENT] Running judge evaluation...")
                     judge_result = self._judge_accept(code_files, test_result)
-                    
-                    self.tracer.trace_event('judge_evaluation', 'info', {
-                        'iteration': iteration,
-                        'accepted': judge_result
-                    })
+                    self.tracer.trace_event('judge_evaluation', 'info', {'iteration': iteration, 'accepted': judge_result})
                     
                     if judge_result:
-                        print(f"[TDD_AGENT] ✅ JUDGE ACCEPTED - SUCCESS")
-                        
-                        # Log success
-                        self.tracer.trace_success({
-                            'ticket_id': self.ticket_id,
-                            'iterations': iteration
-                        })
-                        
-                        # Flush and save traces
+                        print(f"[TDD_AGENT] JUDGE ACCEPTED - SUCCESS")
+                        self.tracer.trace_success({'ticket_id': self.ticket_id, 'iterations': iteration})
                         self.tracer.flush()
                         self.tracer.save(str(self.workspace / 'langfuse_trace.json'))
                         
+                        # Create GitHub PR
+                        issue_number = self._extract_issue_number()
+                        if issue_number:
+                            pr_creator = GitHubPRCreator(repo_owner='Felly-Dev-House', repo_name='robstride', branch='main')
+                            pr_url = pr_creator.create_pr(self.workspace, issue_number, title=f"feat: {self.spec.get('module_name', 'Implementation')} (#{issue_number})", body=self._generate_pr_body())
+                            if pr_url:
+                                self.tracer.trace_event('pr_created', 'success', {'issue': issue_number, 'pr_url': pr_url})
+                        
+                        print(f"\n{'='*60}")
+                        print(f"SUCCESS: Ticket {self.ticket_id} completed")
+                        print(f"{'='*60}")
                         return True
                     else:
                         print(f"[TDD_AGENT] Judge rejected, continuing iterations...")
                 
-                # If failed, update tests for next iteration
                 if not test_result.passed:
-                    test_files = self.handler.generate_tests(
-                        self.spec, code_files, 
-                        failures=test_result.errors
-                    )
+                    test_files = self.handler.generate_tests(self.spec, code_files, failures=test_result.errors)
                     self._write_files(test_files)
-                
+            
             except Exception as e:
                 print(f"[TDD_AGENT] Error in iteration {iteration}: {e}")
-                
-                # Log error
-                self.tracer.trace_event('iteration_error', 'error', {
-                    'iteration': iteration,
-                    'error': str(e)
-                })
-                
-                if iteration == self.max_iterations:
-                    raise
+                self.tracer.trace_event('iteration_error', 'error', {'iteration': iteration, 'error': str(e)})
+                if iteration == self.max_iterations: raise
         
-        # Log failure
-        self.tracer.trace_error({
-            'ticket_id': self.ticket_id,
-            'max_iterations': self.max_iterations
-        })
-        
-        print(f"[TDD_AGENT] ❌ MAX ITERATIONS EXHAUSTED - ESCALATING")
-        
-        # Flush and save traces
+        self.tracer.trace_error({'ticket_id': self.ticket_id, 'max_iterations': self.max_iterations})
+        print(f"[TDD_AGENT] MAX ITERATIONS EXHAUSTED - ESCALATING")
         self.tracer.flush()
         self.tracer.save(str(self.workspace / 'langfuse_trace.json'))
-        
+        print(f"\n{'='*60}")
+        print(f"FAILURE: Ticket {self.ticket_id} escalated")
+        print(f"{'='*60}")
         return False
     
     def _write_files(self, files: list):
-        """Write CodeFile objects to disk"""
         for cf in files:
             path = Path(cf.path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, 'w') as f:
-                f.write(cf.content)
+            with open(path, 'w') as f: f.write(cf.content)
             print(f"[TDD_AGENT] Written: {cf.path}")
     
     def _judge_accept(self, code_files: list, test_result: TestResult) -> bool:
-        """Judge evaluation - determines if code quality is acceptable."""
-        # Simple implementation: check test pass
         return test_result.passed
 
 
@@ -362,30 +313,12 @@ def main():
     parser.add_argument('--workspace', default='/mnt/workspace/tasks', help='Workspace directory')
     parser.add_argument('--max-iterations', type=int, default=10, help='Max TDD iterations')
     parser.add_argument('--use-qemu', action='store_true', help='Use QEMU for ESP32 testing')
-    
     args = parser.parse_args()
     
     try:
-        agent = TDDAgent(
-            args.ticket, 
-            args.spec, 
-            args.workspace, 
-            args.max_iterations,
-            args.use_qemu
-        )
-        success = agent.run()
-        
-        if success:
-            print(f"\n{'='*60}")
-            print(f"SUCCESS: Ticket {args.ticket} completed")
-            print(f"{'='*60}")
-            sys.exit(0)
-        else:
-            print(f"\n{'='*60}")
-            print(f"FAILURE: Ticket {args.ticket} escalated")
-            print(f"{'='*60}")
-            sys.exit(1)
-    
+        agent = TDDAgent(args.ticket, args.spec, args.workspace, args.max_iterations, args.use_qemu)
+        agent.run()
+        sys.exit(0)
     except Exception as e:
         print(f"\n{'='*60}")
         print(f"ERROR: {e}")

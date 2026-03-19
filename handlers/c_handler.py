@@ -43,7 +43,7 @@ class CHandler(BaseHandler):
         print("[C_HANDLER] ESP-IDF environment ready")
         return True
     
-    def generate_tests(self, spec: Dict[str, Any], code_files: List[CodeFile]) -> List[CodeFile]:
+    def generate_tests(self, spec: Dict[str, Any], code_files: List[CodeFile], failures: List[str] = None) -> List[CodeFile]:
         """
         Generate Unity test files for C code.
         

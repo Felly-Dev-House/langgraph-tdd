@@ -43,18 +43,36 @@ LANGFUSE_PUBLIC_KEY = os.environ.get('LANGFUSE_PUBLIC_KEY', '')
 LANGFUSE_SECRET_KEY = os.environ.get('LANGFUSE_SECRET_KEY', '')
 
 class LangfuseTracer:
-    """Minimal Langfuse tracing without external dependencies"""
+    """Langfuse tracing with SDK integration"""
     
     def __init__(self, session_id: str = None):
         self.session_id = session_id or f"tdd-{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        self.enabled = LANGFUSE_ENABLED
+        self.enabled = LANGFUSE_ENABLED and LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY
         self.events = []
+        self.langfuse = None
+        self.trace_id = None
+        self.last_event = None
         
         if self.enabled:
-            print(f"[LANGFUSE] Session: {self.session_id}")
-            print(f"[LANGFUSE] Host: {LANGFUSE_HOST}")
+            try:
+                from langfuse import Langfuse
+                self.langfuse = Langfuse(
+                    public_key=LANGFUSE_PUBLIC_KEY,
+                    secret_key=LANGFUSE_SECRET_KEY,
+                    host=LANGFUSE_HOST
+                )
+                print(f"[LANGFUSE] Connected to {LANGFUSE_HOST}")
+                print(f"[LANGFUSE] Session: {self.session_id}")
+            except Exception as e:
+                print(f"[LANGFUSE] SDK init failed: {e}")
+                self.enabled = False
+        else:
+            if not LANGFUSE_ENABLED:
+                print("[LANGFUSE] Not enabled - no LANGFUSE_HOST set")
+            elif not (LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY):
+                print("[LANGFUSE] Not enabled - missing credentials")
     
-    def trace(self, name: str, event_type: str, data: Dict[str, Any] = None):
+    def trace_event(self, name: str, event_type: str, data: Dict[str, Any] = None):
         """Record a trace event"""
         event = {
             'timestamp': datetime.now().isoformat(),
@@ -65,9 +83,38 @@ class LangfuseTracer:
         }
         self.events.append(event)
         
-        if self.enabled:
-            # Log to stdout (would be sent to Langfuse API in production)
-            print(f"[LANGFUSE] {event_type}: {name}")
+        # Log to console
+        print(f"[LANGFUSE] {event_type}: {name}")
+        
+        # Send to Langfuse if available
+        if self.enabled and self.langfuse:
+            try:
+                from langfuse.types import TraceContext
+                self.last_event = self.langfuse.create_event(
+                    trace_context=TraceContext(id=self.session_id),
+                    name=name,
+                    input=data or {},
+                    level="DEFAULT" if event_type != "error" else "ERROR"
+                )
+            except Exception as e:
+                print(f"[LANGFUSE] Send failed: {e}")
+    
+    def trace_success(self, data: Dict[str, Any] = None):
+        """Mark trace as successful"""
+        self.trace_event('tdd_success', 'success', data or {"status": "success"})
+    
+    def trace_error(self, data: Dict[str, Any] = None):
+        """Mark trace as failed"""
+        self.trace_event('tdd_failure', 'error', data or {"status": "failure"})
+    
+    def flush(self):
+        """Flush pending events"""
+        if self.enabled and self.langfuse:
+            try:
+                self.langfuse.flush()
+                print(f"[LANGFUSE] Events flushed")
+            except Exception as e:
+                print(f"[LANGFUSE] Flush failed: {e}")
     
     def save(self, output_path: str = None):
         """Save trace events to file"""
@@ -78,7 +125,8 @@ class LangfuseTracer:
             json.dump({
                 'session_id': self.session_id,
                 'events': self.events,
-                'langfuse_host': LANGFUSE_HOST if self.enabled else None
+                'langfuse_host': LANGFUSE_HOST if self.enabled else None,
+                'sent_to_api': self.enabled
             }, f, indent=2)
         
         print(f"[LANGFUSE] Traces saved to: {output_path}")
@@ -114,7 +162,7 @@ class TDDAgent:
         print(f"[TDD_AGENT] Starting {self.handler.language_name} TDD for ticket {ticket_id}")
         
         # Log start
-        self.tracer.trace('tdd_start', 'info', {
+        self.tracer.trace_event('tdd_start', 'info', {
             'ticket_id': ticket_id,
             'language': self.language,
             'handler': self.handler.language_name,
@@ -173,7 +221,7 @@ class TDDAgent:
         print(f"[TDD_AGENT] QEMU Mode: {'Enabled' if self.use_qemu else 'Disabled'}")
         
         # Log language detection
-        self.tracer.trace('language_detected', 'info', {
+        self.tracer.trace_event('language_detected', 'info', {
             'language': self.language,
             'handler': self.handler.language_name
         })
@@ -183,9 +231,7 @@ class TDDAgent:
         if not self.handler.setup_environment():
             print(f"[TDD_AGENT] WARNING: Environment setup incomplete")
         
-        self.tracer.trace('environment_setup', 'info', {
-            'status': 'complete'
-        })
+        self.tracer.trace_event('environment_setup', 'info', {'status': 'complete'})
         
         # TDD Loop
         code_files = []
@@ -195,14 +241,14 @@ class TDDAgent:
             print(f"\n[TDD_AGENT] === Iteration {iteration}/{self.max_iterations} ===")
             
             # Log iteration start
-            self.tracer.trace('iteration_start', 'info', {'iteration': iteration})
+            self.tracer.trace_event('iteration_start', 'info', {'iteration': iteration})
             
             try:
                 # Generate tests
                 if iteration == 1:
                     test_files = self.handler.generate_tests(self.spec, code_files)
                     self._write_files(test_files)
-                    self.tracer.trace('tests_generated', 'info', {
+                    self.tracer.trace_event('tests_generated', 'info', {
                         'iteration': iteration,
                         'files': len(test_files)
                     })
@@ -210,7 +256,7 @@ class TDDAgent:
                 # Generate code
                 code_files = self.handler.generate_code(self.spec, test_files)
                 self._write_files(code_files)
-                self.tracer.trace('code_generated', 'info', {
+                self.tracer.trace_event('code_generated', 'info', {
                     'iteration': iteration,
                     'files': len(code_files)
                 })
@@ -220,7 +266,7 @@ class TDDAgent:
                 test_result = self.handler.run_tests(self.workspace)
                 
                 # Log test result
-                self.tracer.trace('tests_executed', 'info', {
+                self.tracer.trace_event('tests_executed', 'info', {
                     'iteration': iteration,
                     'passed': test_result.passed,
                     'duration_ms': test_result.duration_ms
@@ -238,7 +284,7 @@ class TDDAgent:
                     print(f"[TDD_AGENT] Running judge evaluation...")
                     judge_result = self._judge_accept(code_files, test_result)
                     
-                    self.tracer.trace('judge_evaluation', 'info', {
+                    self.tracer.trace_event('judge_evaluation', 'info', {
                         'iteration': iteration,
                         'accepted': judge_result
                     })
@@ -247,12 +293,13 @@ class TDDAgent:
                         print(f"[TDD_AGENT] ✅ JUDGE ACCEPTED - SUCCESS")
                         
                         # Log success
-                        self.tracer.trace('tdd_success', 'success', {
+                        self.tracer.trace_success({
                             'ticket_id': self.ticket_id,
                             'iterations': iteration
                         })
                         
-                        # Save traces
+                        # Flush and save traces
+                        self.tracer.flush()
                         self.tracer.save(str(self.workspace / 'langfuse_trace.json'))
                         
                         return True
@@ -271,7 +318,7 @@ class TDDAgent:
                 print(f"[TDD_AGENT] Error in iteration {iteration}: {e}")
                 
                 # Log error
-                self.tracer.trace('iteration_error', 'error', {
+                self.tracer.trace_event('iteration_error', 'error', {
                     'iteration': iteration,
                     'error': str(e)
                 })
@@ -280,14 +327,15 @@ class TDDAgent:
                     raise
         
         # Log failure
-        self.tracer.trace('tdd_failure', 'error', {
+        self.tracer.trace_error({
             'ticket_id': self.ticket_id,
             'max_iterations': self.max_iterations
         })
         
         print(f"[TDD_AGENT] ❌ MAX ITERATIONS EXHAUSTED - ESCALATING")
         
-        # Save traces even on failure
+        # Flush and save traces
+        self.tracer.flush()
         self.tracer.save(str(self.workspace / 'langfuse_trace.json'))
         
         return False

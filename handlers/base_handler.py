@@ -116,7 +116,7 @@ def detect_language_from_spec(spec: Dict[str, Any]) -> Optional[str]:
             return 'go'
     
     # Check for language keywords in raw content
-    if 'python' in raw_content.lower():
+    if "python" in raw_content.lower() and "esp32" not in raw_content.lower() and "esp-idf" not in raw_content.lower():
         if 'esp-idf' not in raw_content.lower() and 'arduino' not in raw_content.lower():
             return 'python'
     

@@ -51,7 +51,7 @@ class PythonHandler(BaseHandler):
         
         return True
     
-    def generate_tests(self, spec: Dict[str, Any], code_files: List[CodeFile]) -> List[CodeFile]:
+    def generate_tests(self, spec: Dict[str, Any], code_files: List[CodeFile], failures: List[str] = None) -> List[CodeFile]:
         """Generate pytest test files"""
         # This is placeholder - actual test generation done by LLM
         test_files = []

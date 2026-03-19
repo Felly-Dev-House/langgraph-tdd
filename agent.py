@@ -12,8 +12,9 @@ import sys
 import os
 import re
 import time
-from pathlib import Path
 import subprocess
+import shutil
+from pathlib import Path
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -76,10 +77,10 @@ class LangfuseTracer:
 
 
 class GitHubPRCreator:
-    def __init__(self, repo_owner: str, repo_name: str, branch: str = None):
+    def __init__(self, repo_path: str, repo_owner: str, repo_name: str):
+        self.repo_path = Path(repo_path)
         self.repo_owner = repo_owner
         self.repo_name = repo_name
-        self.branch = branch
         self.gh_available = self._check_gh_cli()
         print(f"[GITHUB] gh CLI {'available' if self.gh_available else 'not found - PR creation disabled'}")
     
@@ -100,57 +101,90 @@ class GitHubPRCreator:
             if not body: body = f"## TDD Implementation Complete\n\n**Issue**: #{issue_number}\n**Module**: `{module_name}`\n\nAll tests passed. Ready for code review."
             branch_name = f"tdd/{module_name}-#{issue_number}"
             
+            # Use existing robstride repo
+            if not self.repo_path.exists():
+                print(f"[GITHUB] Repo not found at {self.repo_path}")
+                return None
+            
             original_dir = os.getcwd()
-            clone_dir = task_dir.parent / f"{task_dir.name}-clone"
-            os.chdir(task_dir)
             
             try:
-                # Always create fresh git repo in task directory
-                print(f"[GITHUB] Initializing git repo in {task_dir}")
-                subprocess.run(['git', 'init'], check=True, timeout=10, cwd=str(task_dir), capture_output=True)
-                subprocess.run(['git', 'config', 'user.name', 'TDD Agent'], check=True, timeout=10, cwd=str(task_dir), capture_output=True)
-                subprocess.run(['git', 'config', 'user.email', 'tdd@dev-house.ai'], check=True, timeout=10, cwd=str(task_dir), capture_output=True)
+                # Checkout to repo
+                os.chdir(self.repo_path)
                 
-                # Add remote for robstride repo
-                print(f"[GITHUB] Adding remote...")
-                subprocess.run(['git', 'remote', 'add', 'origin', 'git@github.com:Felly-Dev-House/robstride.git'], check=False, timeout=10, cwd=str(task_dir), capture_output=True)
+                # Fetch latest main
+                subprocess.run(['git', 'fetch', 'origin', 'main'], check=True, timeout=30, capture_output=True)
                 
+                # Create and checkout branch from main
+                print(f"[GITHUB] Creating branch: {branch_name}")
+                subprocess.run(['git', 'checkout', '-b', branch_name], check=True, timeout=10, capture_output=True)
+                
+                # Copy task files to appropriate location in repo
+                print(f"[GITHUB] Copying files from {task_dir}...")
+                # Determine where to copy based on module type
+                target_dir = self.repo_path / 'components' / module_name
+                if not target_dir.exists():
+                    target_dir.mkdir(parents=True)
+                
+                for item in task_dir.iterdir():
+                    if item.name not in ['.git', 'langfuse_trace.json', 'esp_idf_stubs']:
+                        dest = target_dir / item.name
+                        if dest.exists():
+                            if dest.is_dir():
+                                shutil.rmtree(dest)
+                            else:
+                                dest.unlink()
+                        if item.is_dir():
+                            shutil.copytree(item, dest)
+                        else:
+                            shutil.copy2(item, dest)
+                
+                # Add, commit, push
                 print(f"[GITHUB] Adding files...")
                 subprocess.run(['git', 'add', '.'], check=True, timeout=10)
-                print(f"[GITHUB] Committing...")
-                subprocess.run(['git', 'commit', '-m', f'feat: Implement {module_name} for issue #{issue_number}'], check=True, timeout=10)
-                print(f"[GITHUB] Creating branch and pushing...")
-                subprocess.run(['git', 'checkout', '-b', branch_name], check=True, timeout=10)
-                subprocess.run(['git', 'push', '-u', '--force', 'origin', branch_name], check=True, timeout=30)
                 
-                print(f"[GITHUB] PR creation info:")
-                print(f"  Issue: #{issue_number}")
-                print(f"  Branch: {branch_name}")
-                print(f"  Title: {title}")
-                print(f"  Task files: {task_dir}")
-                print(f"[GITHUB] To create PR, run manually:")
-                print(f"  cd {task_dir} && git push origin {branch_name}")
-                print(f"  gh pr create --title '{title}' --body 'TDD completed' --repo {self.repo_owner}/{self.repo_name}")
-                return None
+                print(f"[GITHUB] Committing...")
+                subprocess.run(['git', 'commit', '-m', f'feat: Implement {module_name} for issue #{issue_number}\n\nCloses #{issue_number}'], check=True, timeout=10)
+                
+                print(f"[GITHUB] Pushing to origin/{branch_name}...")
+                subprocess.run(['git', 'push', '-u', '--force', 'origin', branch_name], check=True, timeout=60)
+                
+                # Create PR
+                print(f"[GITHUB] Creating PR for issue #{issue_number}...")
+                pr_result = subprocess.run(['/usr/bin/gh', 'pr', 'create', '--repo', f'{self.repo_owner}/{self.repo_name}', '--head', branch_name, '--base', 'main', '--title', title, '--body', body, '--fill'], capture_output=True, text=True, timeout=30)
+                
+                if pr_result.returncode == 0:
+                    pr_url = pr_result.stdout.strip()
+                    print(f"[GITHUB] ✅ PR created: {pr_url}")
+                    
+                    # Add comment to issue
+                    print(f"[GITHUB] Commenting on issue #{issue_number}...")
+                    subprocess.run(['/usr/bin/gh', 'issue', 'comment', '--repo', f'{self.repo_owner}/{self.repo_name}', f'{issue_number}', '--body', f'🚀 PR created: {pr_url}\n\nTDD completed successfully. Ready for review.'], capture_output=True, timeout=30)
+                    
+                    return pr_url
+                else:
+                    print(f"[GITHUB] PR creation failed: {pr_result.stderr}")
+                    return None
+                    
             finally:
                 os.chdir(original_dir)
-                # Cleanup clone directory
-                if False:  # Disabled
-                    import shutil
-                    pass  # Disabled
+                
         except Exception as e:
             print(f"[GITHUB] Error creating PR: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 
 class TDDAgent:
-    def __init__(self, ticket_id: str, spec_path: str, workspace: str = '/mnt/workspace/tasks', max_iterations: int = 10, use_qemu: bool = False):
+    def __init__(self, ticket_id: str, spec_path: str, workspace: str = '/mnt/workspace/tasks', max_iterations: int = 10, use_qemu: bool = False, robstride_repo: str = '/mnt/workspace/repos/robstride'):
         self.ticket_id = ticket_id
         self.spec_path = Path(spec_path)
         self.workspace = Path(workspace) / ticket_id
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.max_iterations = max_iterations
         self.use_qemu = use_qemu
+        self.robstride_repo = Path(robstride_repo)
         self.tracer = LangfuseTracer(session_id=ticket_id)
         self.spec = self._load_spec()
         self.language = detect_language_from_spec(self.spec)
@@ -271,7 +305,7 @@ Generated by TDD Agent with Langfuse tracing.
                         # Create GitHub PR
                         issue_number = self._extract_issue_number()
                         if issue_number:
-                            pr_creator = GitHubPRCreator(repo_owner='Felly-Dev-House', repo_name='robstride', branch='main')
+                            pr_creator = GitHubPRCreator(repo_path=str(self.robstride_repo), repo_owner='Felly-Dev-House', repo_name='robstride')
                             pr_url = pr_creator.create_pr(self.workspace, issue_number, title=f"feat: {self.spec.get('module_name', 'Implementation')} (#{issue_number})", body=self._generate_pr_body())
                             if pr_url:
                                 self.tracer.trace_event('pr_created', 'success', {'issue': issue_number, 'pr_url': pr_url})
@@ -319,10 +353,11 @@ def main():
     parser.add_argument('--workspace', default='/mnt/workspace/tasks', help='Workspace directory')
     parser.add_argument('--max-iterations', type=int, default=10, help='Max TDD iterations')
     parser.add_argument('--use-qemu', action='store_true', help='Use QEMU for ESP32 testing')
+    parser.add_argument('--robstride-repo', default='/mnt/workspace/repos/robstride', help='Path to robstride repo')
     args = parser.parse_args()
     
     try:
-        agent = TDDAgent(args.ticket, args.spec, args.workspace, args.max_iterations, args.use_qemu)
+        agent = TDDAgent(args.ticket, args.spec, args.workspace, args.max_iterations, args.use_qemu, args.robstride_repo)
         agent.run()
         sys.exit(0)
     except Exception as e:

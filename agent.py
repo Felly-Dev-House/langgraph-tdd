@@ -13,6 +13,7 @@ import os
 import re
 import time
 from pathlib import Path
+import subprocess
 from typing import Dict, Any, Optional
 from datetime import datetime
 
@@ -84,7 +85,7 @@ class GitHubPRCreator:
     
     def _check_gh_cli(self) -> bool:
         try:
-            result = subprocess.run(['gh', '--version'], capture_output=True, text=True, timeout=5)
+            result = subprocess.run(['/usr/bin/gh', '--version'], capture_output=True, text=True, timeout=5)
             return result.returncode == 0
         except: return False
     
@@ -100,38 +101,43 @@ class GitHubPRCreator:
             branch_name = f"tdd/{module_name}-#{issue_number}"
             
             original_dir = os.getcwd()
+            clone_dir = task_dir.parent / f"{task_dir.name}-clone"
             os.chdir(task_dir)
             
             try:
-                result = subprocess.run(['git', 'rev-parse', '--git-dir'], capture_output=True, text=True, timeout=5)
-                if result.returncode != 0:
-                    print(f"[GITHUB] Initializing git repo in {task_dir}")
-                    subprocess.run(['git', 'init'], check=True, timeout=10)
-                    subprocess.run(['git', 'config', 'user.name', 'TDD Agent'], check=True, timeout=10)
-                    subprocess.run(['git', 'config', 'user.email', 'tdd@dev-house.ai'], check=True, timeout=10)
+                # Always create fresh git repo in task directory
+                print(f"[GITHUB] Initializing git repo in {task_dir}")
+                subprocess.run(['git', 'init'], check=True, timeout=10, cwd=str(task_dir), capture_output=True)
+                subprocess.run(['git', 'config', 'user.name', 'TDD Agent'], check=True, timeout=10, cwd=str(task_dir), capture_output=True)
+                subprocess.run(['git', 'config', 'user.email', 'tdd@dev-house.ai'], check=True, timeout=10, cwd=str(task_dir), capture_output=True)
                 
-                print(f"[GITHUB] Creating branch: {branch_name}")
-                subprocess.run(['git', 'checkout', '-b', branch_name], check=True, timeout=10)
+                # Add remote for robstride repo
+                print(f"[GITHUB] Adding remote...")
+                subprocess.run(['git', 'remote', 'add', 'origin', 'git@github.com:Felly-Dev-House/robstride.git'], check=False, timeout=10, cwd=str(task_dir), capture_output=True)
+                
                 print(f"[GITHUB] Adding files...")
                 subprocess.run(['git', 'add', '.'], check=True, timeout=10)
                 print(f"[GITHUB] Committing...")
                 subprocess.run(['git', 'commit', '-m', f'feat: Implement {module_name} for issue #{issue_number}'], check=True, timeout=10)
-                print(f"[GITHUB] Pushing to origin/{branch_name}...")
-                subprocess.run(['git', 'push', '-u', 'origin', branch_name], check=True, timeout=30)
+                print(f"[GITHUB] Creating branch and pushing...")
+                subprocess.run(['git', 'checkout', '-b', branch_name], check=True, timeout=10)
+                subprocess.run(['git', 'push', '-u', '--force', 'origin', branch_name], check=True, timeout=30)
                 
-                print(f"[GITHUB] Creating PR for issue #{issue_number}...")
-                pr_result = subprocess.run(['gh', 'pr', 'create', '--repo', f'{self.repo_owner}/{self.repo_name}', '--head', branch_name, '--base', 'main', '--title', title, '--body', body, '--label', 'status/ready-for-review', '--label', 'phase/tdd-complete'], capture_output=True, text=True, timeout=30)
-                
-                if pr_result.returncode == 0:
-                    pr_url = pr_result.stdout.strip()
-                    print(f"[GITHUB] PR created: {pr_url}")
-                    subprocess.run(['gh', 'issue', 'comment', '--repo', f'{self.repo_owner}/{self.repo_name}', f'{issue_number}', '--body', f'PR created: {pr_url}\n\nTDD completed successfully. Ready for review.'], capture_output=True, timeout=30)
-                    return pr_url
-                else:
-                    print(f"[GITHUB] PR creation failed: {pr_result.stderr}")
-                    return None
+                print(f"[GITHUB] PR creation info:")
+                print(f"  Issue: #{issue_number}")
+                print(f"  Branch: {branch_name}")
+                print(f"  Title: {title}")
+                print(f"  Task files: {task_dir}")
+                print(f"[GITHUB] To create PR, run manually:")
+                print(f"  cd {task_dir} && git push origin {branch_name}")
+                print(f"  gh pr create --title '{title}' --body 'TDD completed' --repo {self.repo_owner}/{self.repo_name}")
+                return None
             finally:
                 os.chdir(original_dir)
+                # Cleanup clone directory
+                if False:  # Disabled
+                    import shutil
+                    pass  # Disabled
         except Exception as e:
             print(f"[GITHUB] Error creating PR: {e}")
             return None

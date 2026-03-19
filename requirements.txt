@@ -1,0 +1,12 @@
+# Language-Agnostic TDD Agent Dependencies
+# Python 3.8+ required
+
+# Core dependencies (none required - uses only stdlib)
+# pytest is needed for Python handler tests (should be installed separately)
+pytest>=7.0.0
+
+# Optional: For C handler (ESP-IDF host tests)
+# ESP-IDF should be installed separately (see README.md)
+
+# Optional: For TypeScript handler
+# Node.js 20+ should be installed separately (see README.md)

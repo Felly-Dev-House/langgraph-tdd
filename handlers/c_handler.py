@@ -34,13 +34,10 @@ class CHandler(BaseHandler):
                 result = subprocess.run(['idf.py', '--version'], capture_output=True, text=True, timeout=10)
                 if result.returncode == 0:
                     print(f"[C_HANDLER] ESP-IDF: {result.stdout.split(chr(10))[0]}")
-                    
-                    # Check for QEMU
                     qemu_result = subprocess.run(['esp32_qemu', '--version'], capture_output=True, text=True, timeout=10)
                     if qemu_result.returncode == 0:
                         self.qemu_available = True
                         print("[C_HANDLER] QEMU available for testing")
-                    
                     return True
             except Exception as e:
                 print(f"[C_HANDLER] ESP-IDF warning: {e}")
@@ -60,7 +57,7 @@ typedef int esp_err_t;
 #define ESP_OK 0
 #define ESP_ERR_INVALID_STATE (-107)
 #define ESP_FAIL (-1)
-static inline const char* esp_err_to_name(int err) { return "error"; }
+static inline const char* esp_err_to_name(int err) { (void)err; return "error"; }
 #endif
 ''')
         
@@ -93,6 +90,7 @@ uint64_t esp_timer_get_time(void);
 #define TWAI_H
 #include <stdint.h>
 #include <stdbool.h>
+#include "esp_err.h"
 
 typedef struct {
     uint8_t tx_io;
@@ -155,7 +153,7 @@ void lv_refr_now(lv_disp_t* disp);
  * Run with: idf.py build-test or idf.py qemu
  */
 #include <stdio.h>
-#include <unity.h>
+#include "unity.h"
 #include "esp_log.h"
 
 #ifdef CONFIG_IDF_TARGET_HOST
@@ -184,13 +182,12 @@ void test_{module_name}_edge_cases(void) {{
     TEST_ASSERT_TRUE(1);
 }}
 
-void app_main(void) {{
-    ESP_LOGI(TAG, "Starting {module_name} tests");
+int main(void) {{
     UNITY_BEGIN();
     RUN_TEST(test_{module_name}_initialization);
     RUN_TEST(test_{module_name}_error_handling);
     RUN_TEST(test_{module_name}_edge_cases);
-    UNITY_END();
+    return UNITY_END();
 }}
 
 #else
@@ -210,14 +207,14 @@ void app_main(void) {{
         """Generate ESP-IDF compatible C code."""
         code_files = []
         module_name = spec.get('module_name', 'generated')
-        raw_content = spec.get('raw', '')
+        raw_content = spec.get('raw', '').lower()
         
-        is_can = 'can' in raw_content.lower() or 'twai' in raw_content.lower()
-        is_ble = 'ble' in raw_content.lower() or 'bluetooth' in raw_content.lower()
-        is_motor = 'motor' in raw_content.lower() or 'odrive' in raw_content.lower()
-        is_display = 'lvgl' in raw_content.lower() or 'display' in raw_content.lower()
+        # Use word boundary matching
+        is_can = bool(re.search(r'\bcan\b|\btwai\b', raw_content))
+        is_ble = bool(re.search(r'\bble\b|\bluetooth\b', raw_content))
+        is_motor = bool(re.search(r'\bmotor\b|\bodrive\b', raw_content))
+        is_display = bool(re.search(r'\blvgl\b|\bdisplay\b|\bscreen\b', raw_content))
         
-        # Header file
         header_content = f'''/*
  * {module_name} header
  * ESP-IDF Compatible - Ready for QEMU testing and hardware flashing
@@ -228,6 +225,7 @@ void app_main(void) {{
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -303,7 +301,7 @@ esp_err_t {module_name}_display_update(void);
 #endif /* ''' + f'''{module_name.upper().replace("-", "_")}_H''' + ''' */
 '''
         
-        # Source file
+        # Generate source with unified init/cleanup
         source_content = f'''/*
  * {module_name} implementation
  * ESP-IDF Compatible - Ready for QEMU testing and hardware flashing
@@ -323,6 +321,7 @@ static bool s_initialized = false;
 
 '''
 
+        # CAN implementation (without init/cleanup)
         if is_can:
             source_content += f'''/* CAN Bus Implementation - ESP-IDF TWAI */
 #include "driver/twai.h"
@@ -338,25 +337,6 @@ static twai_driver_config_t s_twai_config = {{
     .rx_mode = TWAI_NORMAL_MODE,
     .tx_mode = TWAI_NORMAL_MODE,
 }};
-
-esp_err_t {module_name}_init(void) {{
-    if (s_initialized) return ESP_OK;
-    
-    ESP_LOGI(TAG, "Initializing {module_name}");
-    
-#ifdef CONFIG_IDF_TARGET_HOST
-    ESP_LOGI(TAG, "QEMU/Host test mode - skipping TWAI install");
-#else
-    esp_err_t err = twai_driver_install(&s_twai_config, NULL, NULL);
-    if (err != ESP_OK) return err;
-    err = twai_start();
-    if (err != ESP_OK) return err;
-#endif
-    
-    s_initialized = true;
-    ESP_LOGI(TAG, "{module_name} initialized");
-    return ESP_OK;
-}}
 
 esp_err_t {module_name}_send_frame(can_frame_t *frame) {{
     if (!s_initialized) return ESP_ERR_INVALID_STATE;
@@ -401,17 +381,9 @@ esp_err_t {module_name}_set_baudrate(uint32_t baudrate) {{
     return ESP_OK;
 }}
 
-void {module_name}_cleanup(void) {{
-    if (!s_initialized) return;
-    ESP_LOGI(TAG, "Cleaning up {module_name}");
-#ifndef CONFIG_IDF_TARGET_HOST
-    twai_driver_uninstall();
-#endif
-    s_initialized = false;
-}}
-
 '''
         
+        # BLE implementation
         if is_ble:
             source_content += f'''/* BLE Implementation */
 #ifdef CONFIG_IDF_TARGET_HOST
@@ -441,6 +413,7 @@ esp_err_t {module_name}_ble_disconnect(void) {{
 
 '''
         
+        # Motor implementation (without init/cleanup)
         if is_motor:
             source_content += f'''/* Motor Control Implementation */
 static motor_state_t s_motor_state = MOTOR_STATE_DISABLED;
@@ -474,23 +447,13 @@ motor_state_t {module_name}_get_state(void) {{
     return s_motor_state;
 }}
 
-esp_err_t {module_name}_init(void) {{
-    if (s_initialized) return ESP_OK;
-    ESP_LOGI(TAG, "Initializing {module_name}");
-    s_motor_state = MOTOR_STATE_READY;
-    s_initialized = true;
-    return ESP_OK;
-}}
-
-void {module_name}_cleanup(void) {{
-    s_motor_state = MOTOR_STATE_DISABLED;
-    s_initialized = false;
-}}
-
 '''
         
+        # Display implementation - include lvgl.h
         if is_display:
             source_content += f'''/* Display Implementation */
+#include "lvgl.h"
+
 static lv_disp_t *s_disp = NULL;
 static lv_indev_t *s_indev = NULL;
 
@@ -505,6 +468,7 @@ esp_err_t {module_name}_display_clear(void) {{
 }}
 
 esp_err_t {module_name}_display_text(const char *text, int x, int y) {{
+    (void)text; (void)x; (void)y;
     return ESP_OK;
 }}
 
@@ -514,30 +478,35 @@ esp_err_t {module_name}_display_update(void) {{
 
 '''
         
-        if not (is_can or is_ble or is_motor or is_display):
-            source_content += f'''/* Default Implementation */
+        # Unified init/cleanup - only one definition
+        source_content += f'''/* Unified Initialization */
 esp_err_t {module_name}_init(void) {{
     if (s_initialized) return ESP_OK;
+    
     ESP_LOGI(TAG, "Initializing {module_name}");
+    
+#ifdef CONFIG_IDF_TARGET_HOST
+    ESP_LOGI(TAG, "QEMU/Host test mode");
+#else
+#ifdef CONFIG_TWAI_TX_GPIO
+    /* ESP32 device mode - TWAI would be initialized here */
+#endif
+#endif
+    
     s_initialized = true;
+    ESP_LOGI(TAG, "{module_name} initialized");
     return ESP_OK;
 }}
 
 void {module_name}_cleanup(void) {{
+    if (!s_initialized) return;
+    ESP_LOGI(TAG, "Cleaning up {module_name}");
     s_initialized = false;
 }}
 
 bool {module_name}_is_initialized(void) {{
     return s_initialized;
 }}
-
-'''
-        else:
-            source_content += f'''
-bool {module_name}_is_initialized(void) {{
-    return s_initialized;
-}}
-
 '''
         
         include_dir = self.workspace / 'include'
@@ -550,17 +519,13 @@ bool {module_name}_is_initialized(void) {{
         source_path = src_dir / f'{module_name}.c'
         code_files.append(CodeFile(path=str(source_path), content=source_content, language='c'))
         
-        # Create CMakeLists.txt for ESP-IDF
         cmake_content = f'''cmake_minimum_required(VERSION 3.16)
-
 include($ENV{{IDF_PATH}}/tools/cmake/project.cmake)
-
 project({module_name})
 '''
         cmake_path = self.workspace / 'CMakeLists.txt'
         code_files.append(CodeFile(path=str(cmake_path), content=cmake_content, language='cmake'))
         
-        # Create sdkconfig.defaults
         sdkconfig_content = f'''# ESP-IDF Configuration for {module_name}
 CONFIG_IDF_TARGET="esp32"
 CONFIG_FREERTOS_HZ=1000
@@ -577,45 +542,28 @@ CONFIG_TWAI_RX_GPIO=5
         import time
         start_time = time.time()
         
-        # Try ESP-IDF QEMU first
         if self.idf_available:
             try:
                 print("[C_HANDLER] Attempting QEMU test...")
                 cmd = ['idf.py', 'qemu']
                 result = subprocess.run(cmd, cwd=code_dir, capture_output=True, text=True, timeout=120)
-                
                 if result.returncode == 0:
-                    return TestResult(
-                        passed=True,
-                        output=result.stdout,
-                        errors=[],
-                        duration_ms=int((time.time() - start_time) * 1000)
-                    )
-                else:
-                    print(f"[C_HANDLER] QEMU test failed, trying host test...")
+                    return TestResult(passed=True, output=result.stdout, errors=[], duration_ms=int((time.time() - start_time) * 1000))
             except Exception as e:
                 print(f"[C_HANDLER] QEMU error: {e}")
             
-            # Try host test mode
             try:
                 print("[C_HANDLER] Attempting host test...")
                 cmd = ['idf.py', '-B', 'build-host', '-D', 'IDF_TARGET=host', 'build-test']
                 result = subprocess.run(cmd, cwd=code_dir, capture_output=True, text=True, timeout=180)
-                
                 if result.returncode == 0:
                     test_exe = code_dir / 'build-host' / 'host_test' / 'test_runner'
                     if test_exe.exists():
                         run_result = subprocess.run([str(test_exe)], capture_output=True, text=True, timeout=30)
-                        return TestResult(
-                            passed=run_result.returncode == 0,
-                            output=run_result.stdout + run_result.stderr,
-                            errors=[] if run_result.returncode == 0 else [run_result.stderr],
-                            duration_ms=int((time.time() - start_time) * 1000)
-                        )
+                        return TestResult(passed=run_result.returncode == 0, output=run_result.stdout + run_result.stderr, errors=[] if run_result.returncode == 0 else [run_result.stderr], duration_ms=int((time.time() - start_time) * 1000))
             except Exception as e:
                 print(f"[C_HANDLER] Host test error: {e}")
         
-        # Fallback to gcc with stubs
         print("[C_HANDLER] Using gcc with stubs...")
         return self._gcc_with_stubs(code_dir, start_time)
     
@@ -629,19 +577,15 @@ CONFIG_TWAI_RX_GPIO=5
         src_files = list(code_dir.glob('src/*.c'))
         
         if not test_files:
-            return TestResult(
-                passed=False,
-                output="No test files found",
-                errors=["No test files"],
-                duration_ms=int((time.time() - start_time) * 1000)
-            )
+            return TestResult(passed=False, output="No test files found", errors=["No test files"], duration_ms=int((time.time() - start_time) * 1000))
         
-        # Create Unity stub
         unity_stub = '''#ifndef UNITY_H
 #define UNITY_H
-#define TEST_ASSERT_TRUE(x) do { if (!(x)) return 1; } while(0)
-#define UNITY_BEGIN() (0)
-#define UNITY_END() (0)
+#include <stdio.h>
+static int unity_fail = 0;
+#define TEST_ASSERT_TRUE(x) do { if (!(x)) {{ printf("FAIL: %s\\n", #x); unity_fail = 1; }} } while(0)
+#define UNITY_BEGIN() (unity_fail = 0, 0)
+#define UNITY_END() (unity_fail)
 #define RUN_TEST(test) do { test(); } while(0)
 #endif
 '''
@@ -671,24 +615,9 @@ CONFIG_TWAI_RX_GPIO=5
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             
             if result.returncode != 0:
-                return TestResult(
-                    passed=False,
-                    output=result.stdout + result.stderr,
-                    errors=[result.stderr],
-                    duration_ms=int((time.time() - start_time) * 1000)
-                )
+                return TestResult(passed=False, output=result.stdout + result.stderr, errors=[result.stderr], duration_ms=int((time.time() - start_time) * 1000))
             
             run_result = subprocess.run([str(output_exe)], capture_output=True, text=True, timeout=30)
-            return TestResult(
-                passed=run_result.returncode == 0,
-                output=run_result.stdout + run_result.stderr,
-                errors=[] if run_result.returncode == 0 else [run_result.stderr],
-                duration_ms=int((time.time() - start_time) * 1000)
-            )
+            return TestResult(passed=run_result.returncode == 0, output=run_result.stdout + run_result.stderr, errors=[] if run_result.returncode == 0 else [run_result.stderr], duration_ms=int((time.time() - start_time) * 1000))
         except Exception as e:
-            return TestResult(
-                passed=False,
-                output=str(e),
-                errors=[str(e)],
-                duration_ms=int((time.time() - start_time) * 1000)
-            )
+            return TestResult(passed=False, output=str(e), errors=[str(e)], duration_ms=int((time.time() - start_time) * 1000))
